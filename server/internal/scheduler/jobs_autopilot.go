@@ -218,8 +218,8 @@ func autopilotScopes(
 }
 
 // autopilotPlansForScope returns the PlansForScope hook that computes
-// every cron occurrence in (lastPlan, dbNow], keeps only the most recent
-// one, and rejects it if it is outside the dispatch-lateness window.
+// the cron occurrences in (lastPlan, dbNow] that are still inside the
+// dispatch-lateness window, and keeps only the most recent one.
 // The latest-only collapse prevents a long outage from replaying every
 // missed slot; the lateness guard prevents a paused / newly eligible
 // trigger from firing hours after its configured time.
@@ -235,7 +235,6 @@ func autopilotScopes(
 func autopilotPlansForScope(cache *autopilotScheduleCache) func(
 	ctx context.Context, scope Scope, now time.Time, latest LatestPlanInfo,
 ) ([]time.Time, error) {
-	const replayWindow = 24 * time.Hour
 	return func(ctx context.Context, scope Scope, now time.Time, latest LatestPlanInfo) ([]time.Time, error) {
 		cfg, ok := cache.get(scope.ID)
 		if !ok {
@@ -280,8 +279,7 @@ func autopilotPlansForScope(cache *autopilotScheduleCache) func(
 		//      created_at so only occurrences after the trigger
 		//      existed are enumerated.
 		//
-		// Each case feeds into a final safety cap that prevents
-		// enumerating more than `replayWindow` of history at once.
+		// Each case feeds into a final floor at the lateness window.
 		var after time.Time
 		switch {
 		case latest.Found:
@@ -291,13 +289,31 @@ func autopilotPlansForScope(cache *autopilotScheduleCache) func(
 		default:
 			after = cfg.CreatedAt
 		}
-		// Bound replay by CatchUpWindow so a long pause / dormant
-		// trigger does not enumerate millions of historical buckets.
-		// `after` is normally already recent (either latest.PlanTime
-		// or last_fired_at); the cap only matters for the unusual
-		// "trigger created weeks ago but never fired" path.
-		if oldest := now.Add(-replayWindow); after.Before(oldest) {
-			after = oldest
+		// Only an occurrence at most maxAutopilotScheduleLateness old can
+		// fire, so never enumerate from further back. NextOccurrencesUTC
+		// keeps the FIRST 1024 activations of the interval: after a pause
+		// longer than 1024 occurrences of a dense cron ("* * * * *" after
+		// ~17h), the latest kept one is hours stale, nothing is claimed,
+		// the anchor never moves, and the trigger stays silent for good.
+		// The floor is inclusive, matching isAutopilotSchedulePlanStale.
+		//
+		// This floor is also what heals a trigger that an older build
+		// already left silent: the next tick re-anchors inside the
+		// lateness window and the trigger fires again without any cron
+		// change or trigger recreation (the manual recovery steps in
+		// the #8939 report), because the stale anchor is the only
+		// state that pinned it.
+		//
+		// An anchor past `now` — DB clock rollback, or a row written
+		// while an app instance's clock ran ahead — is the mirror
+		// image of that stale anchor: (after, now] is empty on every
+		// tick, so nothing is claimed and the trigger stays silent
+		// until the wall clock catches up, indefinitely for a
+		// far-future plan_time. Both out-of-window anchors recover
+		// through the same floor, and the lateness guard below still
+		// bounds what a recovery may dispatch.
+		if floor := now.Add(-maxAutopilotScheduleLateness); after.Before(floor) || after.After(now) {
+			after = floor.Add(-time.Nanosecond)
 		}
 
 		occs, err := service.NextOccurrencesUTC(cfg.CronExpression, cfg.Timezone, after, now)
