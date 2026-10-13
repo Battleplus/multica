@@ -26,13 +26,8 @@ func planAutopilotTrigger(t *testing.T, cron string, lastPlan, now time.Time) []
 	return plans
 }
 
-// TestAutopilotPlansForScopeDenseCronAfterLongPause is the regression guard
-// for a trigger that resumes after a pause longer than 1024 of its own
-// occurrences. NextOccurrencesUTC keeps the FIRST 1024 activations of
-// (lastPlan, now], so for "* * * * *" the last kept one sits hours in the
-// past, fails the lateness guard, and the hook returns nothing. Nothing is
-// written to sys_cron_executions, lastPlan never moves, and the trigger
-// stays silent on every later tick while next_run_at keeps looking valid.
+// Dense cron schedules must resume even when the pause exceeds the
+// occurrence enumerator's 1024-entry cap (#8939).
 func TestAutopilotPlansForScopeDenseCronAfterLongPause(t *testing.T) {
 	now := time.Date(2026, 9, 4, 16, 5, 10, 0, time.UTC)
 
@@ -77,16 +72,10 @@ func TestAutopilotPlansForScopeDenseCronAfterLongPause(t *testing.T) {
 	}
 }
 
-// TestAutopilotStuckTriggerSelfHealsWithoutManualRecovery replays the exact
-// #8939 stuck state and proves recovery is automatic: the stale anchor is
-// floored into the lateness window on the very next tick, and the healed
-// anchor keeps producing plans afterwards. The report's recovery advice
-// (change the cron to a sparser one, or delete and recreate the trigger) is
-// therefore no longer needed once this fix is deployed.
+// An already-stuck trigger must recover on the next tick and keep firing
+// without a cron change or trigger recreation.
 func TestAutopilotStuckTriggerSelfHealsWithoutManualRecovery(t *testing.T) {
-	// Measured on multica.ai 2026-09-04 16:04 UTC: cron "* * * * *", last
-	// stored plan 2026-09-03 22:05 (≈1080 occurrences back), next_run_at
-	// stuck, zero autopilot_run rows for 10 minutes.
+	// Reproduce the stale anchor reported in #8939.
 	firstTick := time.Date(2026, 9, 4, 16, 5, 10, 0, time.UTC)
 	silentSince := time.Date(2026, 9, 3, 22, 5, 0, 0, time.UTC)
 
@@ -106,19 +95,15 @@ func TestAutopilotStuckTriggerSelfHealsWithoutManualRecovery(t *testing.T) {
 	}
 }
 
-// TestAutopilotPlansForScopeFutureAnchorCannotSilenceTrigger guards the other
-// permanent-silence shape: an anchor past `now` (DB clock rollback, or a row
-// written by an instance whose clock ran ahead) makes (after, now] empty on
-// every tick, so the trigger stays silent until the wall clock passes the
-// stored plan_time — indefinitely for a far-future row. Such an anchor now
-// recovers through the same lateness floor as a stale one, and the guard
-// still bounds what that recovery may dispatch.
-func TestAutopilotPlansForScopeFutureAnchorCannotSilenceTrigger(t *testing.T) {
+// Preserve the existing behavior for future and already-claimed anchors:
+// wait for a later occurrence instead of moving the anchor backwards.
+func TestAutopilotPlansForScopeDoesNotRewindAnchor(t *testing.T) {
 	now := time.Date(2026, 9, 4, 16, 5, 10, 0, time.UTC)
 	current := time.Date(2026, 9, 4, 16, 5, 0, 0, time.UTC)
+	future := current.Add(6 * time.Hour)
 
-	if plans := planAutopilotTrigger(t, "* * * * *", now.Add(6*time.Hour), now); len(plans) != 1 || !plans[0].Equal(current) {
-		t.Fatalf("future anchor: plans = %v, want [%s]", plans, current.Format(time.RFC3339))
+	if plans := planAutopilotTrigger(t, "* * * * *", future, now); len(plans) != 0 {
+		t.Fatalf("future anchor: plans = %v, want none", plans)
 	}
 	// An anchor exactly at `now` is a healthy already-claimed slot: stay
 	// quiet this tick (no duplicate claim of the same occurrence) and fire
@@ -129,6 +114,13 @@ func TestAutopilotPlansForScopeFutureAnchorCannotSilenceTrigger(t *testing.T) {
 	next := current.Add(time.Minute)
 	if plans := planAutopilotTrigger(t, "* * * * *", current, now.Add(time.Minute)); len(plans) != 1 || !plans[0].Equal(next) {
 		t.Fatalf("steady state past an anchor at now: plans = %v, want [%s]", plans, next.Format(time.RFC3339))
+	}
+	if plans := planAutopilotTrigger(t, "* * * * *", future, future); len(plans) != 0 {
+		t.Fatalf("clock reaches the stored anchor: plans = %v, want none", plans)
+	}
+	firstDue := future.Add(time.Minute)
+	if plans := planAutopilotTrigger(t, "* * * * *", future, firstDue); len(plans) != 1 || !plans[0].Equal(firstDue) {
+		t.Fatalf("clock passes the stored anchor: plans = %v, want [%s]", plans, firstDue.Format(time.RFC3339))
 	}
 }
 
